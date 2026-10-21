@@ -36,7 +36,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov PyYAML
           pip install -r claudecode/requirements.txt
 
       - name: Run ClaudeCode unit tests

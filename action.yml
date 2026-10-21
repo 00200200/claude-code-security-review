@@ -65,7 +65,17 @@ runs:
       run: |
         echo "::group::Install gh CLI"
         # Install GitHub CLI for PR operations
-        sudo apt-get update && sudo apt-get install -y gh
+        if ! command -v gh >/dev/null 2>&1; then
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y gh || true
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update && apt-get install -y gh || true
+          fi
+        fi
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "::error::gh is required but could not be installed or found in PATH."
+          exit 1
+        fi
         echo "::endgroup::"
     
     - name: Set up Python
@@ -203,13 +213,13 @@ runs:
         echo "Running ClaudeCode AI security analysis..."
         echo "----------------------------------------"
         
-        # Initialize outputs
-        echo "findings_count=0" >> $GITHUB_OUTPUT
-        echo "results_file=claudecode/claudecode-results.json" >> $GITHUB_OUTPUT
+        # Publish the count only after successful parsing.
+        echo "results_file=claudecode/claudecode-results.json" >> "$GITHUB_OUTPUT"
         
         # Skip ClaudeCode if not a PR
         if [ "${{ github.event_name }}" != "pull_request" ]; then
           echo "ClaudeCode only runs on pull requests, skipping"
+          echo "findings_count=0" >> "$GITHUB_OUTPUT"
           exit 0
         fi
         
@@ -229,6 +239,20 @@ runs:
         # Run ClaudeCode audit with verbose debugging
         export REPO_PATH=$(pwd)
         cd "$ACTION_PATH"
+
+        # Preserve diagnostics even when result validation exits early.
+        copy_artifacts() {
+          if [ -f findings.json ]; then
+            cp findings.json "$GITHUB_WORKSPACE/findings.json" || true
+          fi
+          if [ -f claudecode/claudecode-results.json ]; then
+            cp claudecode/claudecode-results.json "$GITHUB_WORKSPACE/claudecode-results.json" || true
+          fi
+          if [ -f claudecode/claudecode-error.log ]; then
+            cp claudecode/claudecode-error.log "$GITHUB_WORKSPACE/claudecode-error.log" || true
+          fi
+        }
+        trap copy_artifacts EXIT
         
         # Enable verbose debugging
         echo "::group::ClaudeCode Environment"
@@ -264,13 +288,13 @@ runs:
           
           # Check if file is empty or too small
           if [ "$FILE_SIZE" -lt 2 ]; then
-            echo "::warning::ClaudeCode results file is empty or invalid (size: $FILE_SIZE bytes)"
-            echo "::warning::ClaudeCode may have failed silently. Check claudecode-error.log"
+            echo "::error::ClaudeCode results file is empty or invalid (size: $FILE_SIZE bytes)"
+            echo "::error::ClaudeCode may have failed silently. Check claudecode-error.log"
             if [ -f claudecode/claudecode-error.log ]; then
               echo "Error log contents:"
               cat claudecode/claudecode-error.log
             fi
-            echo "findings_count=0" >> $GITHUB_OUTPUT
+            exit 1
           else
             echo "ClaudeCode results preview:"
             head -n 300 claudecode/claudecode-results.json || echo "Unable to preview results"
@@ -281,9 +305,9 @@ runs:
               exit 1
             fi
 
-            # Verify results file is valid JSON
-            if ! jq empty claudecode/claudecode-results.json > /dev/null 2>&1; then
-              echo "::error::ClaudeCode results file is not valid JSON."
+            # Require one result object; jq also accepts empty input and JSON streams.
+            if ! jq -e -s 'length == 1 and (.[0] | type == "object" and (.findings == null or (.findings | type == "array")))' claudecode/claudecode-results.json > /dev/null 2>&1; then
+              echo "::error::ClaudeCode results must be one valid JSON object with an optional findings array."
               if [ -f claudecode/claudecode-error.log ]; then
                 echo "Error log contents:"
                 cat claudecode/claudecode-error.log
@@ -292,46 +316,38 @@ runs:
             fi
 
             # Check if the result is an error
-            if jq -e '.error' claudecode/claudecode-results.json > /dev/null 2>&1; then
+            ERROR_CHECK_STATUS=0
+            jq -e '.error' claudecode/claudecode-results.json > /dev/null 2>&1 || ERROR_CHECK_STATUS=$?
+            if [ "$ERROR_CHECK_STATUS" -gt 1 ]; then
+              echo "::error::Failed to check ClaudeCode results for an error."
+              exit 1
+            elif [ "$ERROR_CHECK_STATUS" -eq 0 ]; then
               ERROR_MSG=$(jq -r '.error' claudecode/claudecode-results.json)
-              echo "::warning::ClaudeCode error: $ERROR_MSG"
-              echo "findings_count=0" >> $GITHUB_OUTPUT
+              echo "::error::ClaudeCode error: $ERROR_MSG"
+              exit 1
             else
               # Use -r to get raw output and handle potential null/missing findings array
               if ! CLAUDECODE_FINDINGS_COUNT=$(jq -r '.findings | if . == null then 0 else length end' claudecode/claudecode-results.json); then
                 echo "::error::Failed to parse findings count from ClaudeCode results."
                 exit 1
               fi
-              echo "::debug::Extracted ClaudeCode findings count: $CLAUDECODE_FINDINGS_COUNT"
-              echo "findings_count=$CLAUDECODE_FINDINGS_COUNT" >> $GITHUB_OUTPUT
-              echo "ClaudeCode found $CLAUDECODE_FINDINGS_COUNT security issues"
-              
               # Also create findings.json for PR comment script
               if ! jq '.findings // []' claudecode/claudecode-results.json > findings.json; then
                 echo "::error::Failed to extract findings array to findings.json."
                 exit 1
               fi
+              echo "::debug::Extracted ClaudeCode findings count: $CLAUDECODE_FINDINGS_COUNT"
+              echo "findings_count=$CLAUDECODE_FINDINGS_COUNT" >> "$GITHUB_OUTPUT"
+              echo "ClaudeCode found $CLAUDECODE_FINDINGS_COUNT security issues"
             fi
           fi
         else
-          echo "::warning::ClaudeCode results file not found"
+          echo "::error::ClaudeCode results file not found"
           if [ -f claudecode/claudecode-error.log ]; then
             echo "Error log contents:"
             cat claudecode/claudecode-error.log
           fi
-          echo "findings_count=0" >> $GITHUB_OUTPUT
-        fi
-        
-        # Always copy files to workspace root regardless of the outcome
-        # This ensures artifact upload and PR commenting can find them
-        if [ -f findings.json ]; then
-          cp findings.json ${{ github.workspace }}/findings.json || true
-        fi
-        if [ -f claudecode/claudecode-results.json ]; then
-          cp claudecode/claudecode-results.json ${{ github.workspace }}/claudecode-results.json || true
-        fi
-        if [ -f claudecode/claudecode-error.log ]; then
-          cp claudecode/claudecode-error.log ${{ github.workspace }}/claudecode-error.log || true
+          exit 1
         fi
         
         echo "::endgroup::"
